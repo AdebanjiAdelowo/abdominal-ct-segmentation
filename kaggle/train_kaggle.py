@@ -8,7 +8,7 @@ Usage (inside a Kaggle notebook cell):
     !pip install -r requirements.txt -q
     !python kaggle/train_kaggle.py
 
-Expected Kaggle dataset path: /kaggle/input/task03-liver-npy-dataset/
+Expected Kaggle dataset path: /kaggle/input/datasets/zeynepzelk/task03-liver-npy-dataset/
 All outputs (checkpoints, metrics CSV, visualisations) go to /kaggle/working/.
 
 Dataset directory layout inferred from the Kaggle dataset page:
@@ -38,7 +38,7 @@ from src.utils.device import get_device
 # Environment constants
 # ---------------------------------------------------------------------------
 
-DATASET_DIR = "/kaggle/input/task03-liver-npy-dataset/"
+DATASET_DIR = "/kaggle/input/datasets/zeynepzelk/task03-liver-npy-dataset/"
 OUTPUT_DIR = "/kaggle/working/"
 CONFIG_PATH = _REPO_ROOT / "configs" / "config.yaml"
 

@@ -3,7 +3,7 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
-data/
+/data/
 checkpoints/
 outputs/
 *.pth

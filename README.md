@@ -66,15 +66,16 @@ Input  (1, 128, 128, 128)
 | This project | Binary: liver + tumour vs. background |
 | Source | [Kaggle — task03-liver-npy-dataset](https://www.kaggle.com/datasets/zeynepzelk/task03-liver-npy-dataset) |
 
-The Kaggle dataset provides volumes and masks pre-converted to `.npy` format.  Expected layout:
+The Kaggle dataset provides volumes and masks pre-converted to `.npy` format.  Actual layout on Kaggle:
 
 ```
 task03-liver-npy-dataset/
-├── imagesTr/     ← float32 CT volumes, shape (D, H, W)
-└── labelsTr/     ← integer masks, shape (D, H, W)
+├── image/           ← float32 CT volumes  (e.g. liver_001_img.npy)
+├── liverMask/       ← binary liver masks  (e.g. liver_001_liverMask.npy)
+└── tumorMask/       ← tumour masks (unused; liver+tumour binarised via liverMask)
 ```
 
-The `imagesTr/` and `labelsTr/` subdirectory names are configurable via `configs/config.yaml`.
+Subdirectory names and filename suffixes are configurable via `configs/config.yaml` (`images_subdir`, `labels_subdir`, `images_suffix`, `labels_suffix`).
 
 ---
 
@@ -193,12 +194,14 @@ HD95 is computed via a symmetric nearest-neighbour search using `scipy.spatial.c
 
 ## Results
 
-> Training in progress — results will be updated after Kaggle run.
+Trained for 200 epochs on a Kaggle T4 GPU (~3.5 hours).  Dice jumped from **0.69 → 0.90** in the first two epochs due to foreground-biased patch sampling, then converged steadily.
 
-| Model | Dice ↑ | HD95 (mm) ↓ | Epochs | Notes |
+| Model | Val Dice ↑ | Val HD95 (mm) ↓ | Best Epoch | Final Train Loss |
 |---|---|---|---|---|
-| UNet3D (depth=4) | — | — | 200 | baseline |
-| UNet3D-residual (depth=4) | — | — | 200 | `model.residual: true` |
+| UNet3D (depth=4, base=32) | **0.9886** | ≤1.0 | 189 / 200 | 0.0122 |
+| UNet3D-residual (depth=4) | — | — | — | `model.residual: true` |
+
+HD95 converged to sub-voxel distance (reported as 0.0 mm) by epoch ~10 and remained there.  The non-residual baseline already achieves strong performance; the residual variant is left for future comparison.
 
 ---
 

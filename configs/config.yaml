@@ -1,0 +1,54 @@
+# =============================================================================
+# Abdominal CT Segmentation — Master Configuration
+# All hyperparameters live here. No hard-coded values in source code.
+# =============================================================================
+
+dataset:
+  data_dir: "data/"                    # local root (overridden in train_kaggle.py)
+  images_subdir: "imagesTr"            # subdirectory containing image .npy files
+  labels_subdir: "labelsTr"            # subdirectory containing mask .npy files
+  val_split: 0.2                       # fraction of volumes held out for validation
+  num_workers: 4                       # DataLoader worker processes
+  pin_memory: true                     # pin memory for faster GPU transfer
+
+preprocessing:
+  patch_size: [128, 128, 128]          # (D, H, W) training / validation crop
+  intensity_clip: [-200, 250]          # liver-relevant Hounsfield unit window
+  normalize: true                      # per-volume z-score normalisation after clipping
+
+model:
+  in_channels: 1                       # single-modality CT
+  out_channels: 1                      # binary segmentation (liver vs. background)
+  base_features: 32                    # feature width at the first encoder level
+  depth: 4                             # number of encoder / decoder levels
+  residual: false                      # true → residual U-Net variant
+  dropout: 0.0                         # Dropout3d probability (0 = disabled)
+
+training:
+  batch_size: 2
+  epochs: 200
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  grad_clip: 1.0                       # max gradient L2-norm before clipping
+  dice_weight: 0.5                     # weight of soft-Dice term in combined loss
+  bce_weight: 0.5                      # weight of BCE term in combined loss
+  scheduler:
+    type: cosine
+    eta_min: 1.0e-6                    # minimum learning rate at end of cosine cycle
+
+validation:
+  val_interval: 1                      # validate every N epochs
+  hausdorff_percentile: 95             # percentile for surface distance metric
+
+inference:
+  sw_batch_size: 4                     # MONAI sliding-window sub-batch size
+  overlap: 0.5                         # patch overlap fraction (Gaussian weighting)
+  patch_size: [128, 128, 128]          # must match preprocessing.patch_size
+
+checkpoint:
+  save_dir: "checkpoints/"
+  save_best: true
+  monitor: "val_dice"                  # metric used to select best checkpoint
+
+logging:
+  metrics_csv: "metrics.csv"           # per-epoch metrics log (epoch, loss, Dice, HD95)

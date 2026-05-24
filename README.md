@@ -203,6 +203,18 @@ Trained for 200 epochs on a Kaggle T4 GPU (~3.5 hours).  Dice jumped from **0.69
 
 HD95 converged to sub-voxel distance (reported as 0.0 mm) by epoch ~10 and remained there.  The non-residual baseline already achieves strong performance; the residual variant is left for future comparison.
 
+### Learning curves
+
+![Learning curves — train loss, val Dice, val HD95 over 200 epochs](docs/images/learning_curves.png)
+
+### Segmentation overlays
+
+Three held-out validation volumes.  Each panel shows axial · coronal · sagittal slices with the predicted liver mask overlaid in pink.
+
+![liver_0](docs/images/liver_0_img.png)
+![liver_100](docs/images/liver_100_img.png)
+![liver_101](docs/images/liver_101_img.png)
+
 ---
 
 ## References

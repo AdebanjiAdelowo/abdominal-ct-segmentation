@@ -8,6 +8,8 @@ checkpoints/
 outputs/
 *.pth
 metrics.csv
+results/
+results.zip
 .ipynb_checkpoints/
 *.egg-info/
 dist/

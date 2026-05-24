@@ -60,13 +60,19 @@ class LiverCTDataset(Dataset):
         images_dir = Path(data_dir) / self.cfg_data["images_subdir"]
         labels_dir = Path(data_dir) / self.cfg_data["labels_subdir"]
 
+        img_suffix = self.cfg_data.get("images_suffix", "")
+        lbl_suffix = self.cfg_data.get("labels_suffix", "")
+
         if file_list is None:
-            file_list = sorted(p.stem for p in images_dir.glob("*.npy"))
+            file_list = sorted(
+                p.stem[: -len(img_suffix)] if img_suffix else p.stem
+                for p in images_dir.glob("*.npy")
+            )
 
         self.samples: List[Tuple[Path, Optional[Path]]] = []
         for name in file_list:
-            img_path = images_dir / f"{name}.npy"
-            lbl_path = labels_dir / f"{name}.npy"
+            img_path = images_dir / f"{name}{img_suffix}.npy"
+            lbl_path = labels_dir / f"{name}{lbl_suffix}.npy"
             if not img_path.exists():
                 continue
             self.samples.append(
@@ -200,7 +206,11 @@ def build_dataloaders(
         (train_loader, val_loader)
     """
     images_dir = Path(data_dir) / config["dataset"]["images_subdir"]
-    all_files = sorted(p.stem for p in images_dir.glob("*.npy"))
+    img_suffix = config["dataset"].get("images_suffix", "")
+    all_files = sorted(
+        p.stem[: -len(img_suffix)] if img_suffix else p.stem
+        for p in images_dir.glob("*.npy")
+    )
 
     if not all_files:
         raise FileNotFoundError(

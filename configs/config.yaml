@@ -5,8 +5,10 @@
 
 dataset:
   data_dir: "data/"                    # local root (overridden in train_kaggle.py)
-  images_subdir: "imagesTr"            # subdirectory containing image .npy files
-  labels_subdir: "labelsTr"            # subdirectory containing mask .npy files
+  images_subdir: "image"               # subdirectory containing image .npy files
+  labels_subdir: "liverMask"           # subdirectory containing mask .npy files
+  images_suffix: "_img"                # filename suffix appended after the case ID
+  labels_suffix: "_liverMask"          # filename suffix appended after the case ID
   val_split: 0.2                       # fraction of volumes held out for validation
   num_workers: 4                       # DataLoader worker processes
   pin_memory: true                     # pin memory for faster GPU transfer

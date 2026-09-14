@@ -233,6 +233,17 @@ Three held-out validation volumes.  Each panel shows axial · coronal · sagitta
 
 ---
 
+## Remaining Work
+
+The HD95 metric implementation is fixed and covered by a synthetic regression test (see above),
+but the true corrected HD95 for this already-trained model could not be recomputed: the MSD
+Task03 dataset is not present locally, and no saved prediction volumes exist to recompute against
+directly. This is blocked on dataset availability, not on any remaining code work; do not treat
+the old, buggy 0.00mm figure as valid, and do not estimate a replacement value. If the dataset
+becomes available, recompute via `src/inference/predict.py` against `results/checkpoints/best.pth`
+and the now-corrected `hausdorff_95`. Portfolio-wide project status is tracked centrally in the
+author's Selected Projects documentation; this project's status there is BLOCKED.
+
 ## References
 
 1. Ö. Çiçek et al., *3D U-Net: Learning Dense Volumetric Segmentation from Sparse Annotation*, MICCAI 2016. [arXiv:1606.06650](https://arxiv.org/abs/1606.06650)

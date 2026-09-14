@@ -97,7 +97,7 @@ abdominal-ct-segmentation/
 │   │   └── visualise.py        # axial/coronal/sagittal PNG output
 │   └── utils/
 │       ├── device.py           # CUDA → MPS → CPU selection
-│       └── metrics.py          # Dice score, HD95 (scipy cKDTree)
+│       └── metrics.py          # Dice score, surface-based HD95 (scipy erosion + cKDTree)
 ├── kaggle/
 │   └── train_kaggle.py         # Kaggle notebook entry point
 ├── configs/
@@ -105,6 +105,8 @@ abdominal-ct-segmentation/
 ├── docs/images/                # figures embedded in this README
 ├── notebooks/
 │   └── results.ipynb           # reads metrics.csv, renders learning curves and overlays
+├── tests/
+│   └── test_hd95.py            # HD95 regression tests (synthetic, known-answer geometry)
 ├── requirements.txt
 └── README.md
 ```
@@ -196,7 +198,11 @@ All hyperparameters are in `configs/config.yaml`.  Notable entries:
 | **Dice** | Volumetric overlap: $2\|P \cap G\| / (\|P\| + \|G\|)$ |
 | **HD95** | 95th percentile of the pooled bidirectional nearest-neighbour distance (mm) |
 
-HD95 is computed via `scipy.spatial.cKDTree` nearest-neighbour search (`hausdorff_95` in `src/utils/metrics.py`), avoiding an external `medpy` dependency, but the implementation differs from the surface-distance convention used by MONAI's `compute_hausdorff_distance` and MedPy's `hd95` in two ways: (1) it queries nearest neighbours over **all** foreground voxels of the prediction and ground truth rather than over extracted surface/boundary voxels only, and (2) it pools the prediction-to-target and target-to-prediction distances into a single array and takes one percentile of the pooled array, rather than taking the 95th percentile of each direction separately and reporting the maximum of the two. Once a mask overlaps well, correctly classified interior voxels (distance 0) vastly outnumber boundary voxels in this pooled, non-surface point set, which pulls the percentile toward zero regardless of how large the true boundary error is. A controlled synthetic check (two 40³ solid cubes offset by a known 3-voxel shift) confirms this: the standard surface-based HD95 (MONAI/MedPy convention) gives 3.0 voxels, matching the true offset, while this repository's `hausdorff_95` on the same pair gives 1.05 voxels. Treat the HD95 values reported below as a non-standard, systematically-optimistic variant, not as a value directly comparable to HD95 numbers reported in the medical segmentation literature (e.g. Antonelli et al., *The Medical Segmentation Decathlon*, Nat. Commun. 2022, or MONAI's own metric); this is almost certainly why HD95 reads exactly 0.00 mm for most of training below despite Dice not yet being perfect.
+HD95 is computed via `scipy.spatial.cKDTree` nearest-neighbour search (`hausdorff_95` in `src/utils/metrics.py`), avoiding an external `medpy` dependency. An earlier version of this function differed from the surface-distance convention used by MONAI's `compute_hausdorff_distance` and MedPy's `hd95` in two ways: it queried nearest neighbours over all foreground voxels of the prediction and ground truth rather than over extracted surface/boundary voxels only, and it pooled the prediction-to-target and target-to-prediction distances into a single array and took one percentile of the pooled array, rather than taking the 95th percentile of each direction separately and reporting the maximum of the two. That version is why HD95 read exactly 0.00 mm for most of the 200-epoch training run reported below despite Dice not yet being perfect: once a mask overlapped well, correctly classified interior voxels (distance 0) vastly outnumbered boundary voxels in that pooled, non-surface point set, pulling the percentile toward zero regardless of the true boundary error.
+
+`hausdorff_95` has since been corrected: it now extracts surface voxels from each mask via binary erosion (`scipy.ndimage.binary_erosion`), computes directed nearest-neighbour surface distances independently in each direction, takes the 95th percentile of each direction separately, and returns the maximum of the two (`src/utils/metrics.py`, and see `tests/test_hd95.py`). A controlled synthetic check (two 40-voxel-edge solid cubes offset by a known 3-voxel shift) confirms the fix: the old implementation returned 1.05 voxels on that input, while the corrected implementation returns 3.0 voxels, matching the true offset exactly and agreeing with the MONAI/MedPy convention.
+
+The 200-epoch training run whose curves and table appear below was logged with the old, buggy `hausdorff_95`, so the historical `val_hd95` column in `results/metrics.csv` is not a valid boundary-accuracy figure and is kept only as a raw historical record, not a claim. Recomputing a corrected HD95 for that specific trained model would require either saved per-epoch prediction volumes (not retained) or re-running full-volume inference against the original dataset split; neither was available at the time of the fix, so no corrected HD95 number is reported for the trained model below. The Dice score is unaffected by this bug and remains valid as reported.
 
 ---
 
@@ -204,12 +210,12 @@ HD95 is computed via `scipy.spatial.cKDTree` nearest-neighbour search (`hausdorf
 
 Trained for 200 epochs on a Kaggle T4 GPU (wall-clock time was not logged).  Dice jumped from **0.69 to 0.90** in the first two epochs due to foreground-biased patch sampling, then converged steadily (values from `results/metrics.csv`).
 
-| Model | Val Dice ↑ | Val HD95 (mm) ↓ | Best Epoch | Final Train Loss |
+| Model | Val Dice ↑ | Val HD95 (mm) | Best Epoch | Final Train Loss |
 |---|---|---|---|---|
-| UNet3D (depth=4, base=32) | **0.9886** | 0.00 | 189 / 200 | 0.0122 |
+| UNet3D (depth=4, base=32) | **0.9886** | not available (see below) | 189 / 200 | 0.0122 |
 | UNet3D-residual (depth=4) | n/a | n/a | n/a | `model.residual: true` |
 
-HD95 converged to 0.00 mm (sub-voxel, per `hausdorff_95` in `src/utils/metrics.py`) by epoch ~10 and remained there.  The non-residual baseline already achieves strong performance; the residual variant is left for future comparison.
+**0.9886 Dice on a 128³-patch internal validation split (no independent test set).** The `val_hd95` column logged during this run used the buggy pooled, non-surface `hausdorff_95` described above and read 0.00 mm for nearly the entire run; that figure should not be cited as a boundary-accuracy result. `hausdorff_95` has since been fixed and is covered by a synthetic regression test (`tests/test_hd95.py`) that verifies it against a known-correct geometric answer, but no saved prediction volumes or checkpoints-plus-dataset pairing were available to recompute a real HD95 for this specific trained model after the fix, so no corrected HD95 number is reported here. Recomputing one would require re-running full-volume sliding-window inference (`src/inference/predict.py`) against the original MSD Task03 validation split and the saved `results/checkpoints/best.pth` weights. The non-residual baseline already achieves strong Dice; the residual variant is left for future comparison.
 
 **What these numbers measure:** both metrics are computed during training on a single centre-cropped 128³ validation patch per volume (`LiverCTDataset` in `'val'` mode, see `src/data/dataset.py`), the same patch size used for training, not on full-volume sliding-window inference. Full-volume inference (`src/inference/predict.py`, MONAI `sliding_window_inference`) is used only to generate the qualitative overlays below for 3 held-out cases; it is not what the Dice/HD95 table reports. Treat the table as a patch-level validation result on this dataset, not a full-volume or externally validated benchmark.
 

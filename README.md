@@ -233,16 +233,16 @@ Three held-out validation volumes.  Each panel shows axial · coronal · sagitta
 
 ---
 
-## Remaining Work
+## Limitations
 
-The HD95 metric implementation is fixed and covered by a synthetic regression test (see above),
-but the true corrected HD95 for this already-trained model could not be recomputed: the MSD
-Task03 dataset is not present locally, and no saved prediction volumes exist to recompute against
-directly. This is blocked on dataset availability, not on any remaining code work; do not treat
-the old, buggy 0.00mm figure as valid, and do not estimate a replacement value. If the dataset
-becomes available, recompute via `src/inference/predict.py` against `results/checkpoints/best.pth`
-and the now-corrected `hausdorff_95`. Portfolio-wide project status is tracked centrally in the
-author's Selected Projects documentation; this project's status there is BLOCKED.
+The HD95 metric implementation had a bug (pooled, non-surface distance) that produced an
+invalid 0.00 mm reading for nearly the entire training run; it has since been fixed and is
+covered by a synthetic regression test (`tests/test_hd95.py`). A corrected HD95 for the
+already-trained model could not be recomputed, since the MSD Task03 dataset is not present
+locally and no saved prediction volumes exist to recompute against directly. The old 0.00 mm
+figure should not be treated as valid. Recomputing a corrected value would require
+`src/inference/predict.py` against `results/checkpoints/best.pth` and the fixed `hausdorff_95`,
+once the dataset is available.
 
 ## References
 

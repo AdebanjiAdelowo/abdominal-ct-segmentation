@@ -90,7 +90,7 @@ abdominal-ct-segmentation/
 │   │   ├── dataset.py          # LiverCTDataset, NiftiLiverDataset, split_case_names, build_dataloaders
 │   │   ├── nifti.py            # NIfTI loading with voxel spacing / orientation handling
 │   │   ├── splits.py           # frozen 3-way split, SHA-256 fingerprint
-│   │   └── validate_dataset.py # dataset structure checks
+│   │   └── validate_dataset.py # structure and duplicate-content checks
 │   ├── models/
 │   │   └── unet3d.py           # UNet3D, ConvBlock, EncoderBlock, DecoderBlock
 │   ├── training/
@@ -100,7 +100,7 @@ abdominal-ct-segmentation/
 │   │   ├── predict.py          # sliding-window inference (MONAI)
 │   │   ├── evaluate.py         # historical .npy format: full-volume Dice + HD95 in voxels only
 │   │   ├── evaluate_protocol.py# new protocol: NIfTI, full-volume Dice + HD95 in mm, test-set guards
-│   │   └── visualise.py        # axial/coronal/sagittal PNG output
+│   │   └── visualise.py        # orthogonal mid-slice overlay PNGs (neutral axis labels)
 │   ├── utils/
 │   │   ├── device.py           # CUDA → MPS → CPU selection
 │   │   ├── metrics.py          # Dice score, surface-based HD95 (scipy erosion + cKDTree)
@@ -114,14 +114,15 @@ abdominal-ct-segmentation/
 │   └── config.yaml             # all hyperparameters
 ├── docs/
 │   ├── EVALUATION_PROTOCOL.md  # split, leakage rules, mm-HD95, aggregation, reporting rules
-│   └── images/                 # figures embedded in this README
+│   └── images/                 # learning curve used by this README; historical overlay PNGs kept for audit provenance only
 ├── notebooks/
-│   └── results.ipynb           # reads metrics.csv, renders learning curves and overlays
+│   └── results.ipynb           # reads metrics.csv, renders the learning curves
 ├── tests/
 │   ├── test_hd95.py            # HD95 regression tests (synthetic, known-answer geometry)
 │   ├── test_evaluate.py        # historical full-volume evaluator (synthetic data)
 │   ├── test_protocol.py        # split, NIfTI geometry, mm-HD95, leakage guards (synthetic data)
-│   └── test_infrastructure.py  # checkpoints, resume, validator, smoke test (synthetic data)
+│   ├── test_infrastructure.py  # checkpoints, resume, validator, duplicate-content checks, smoke test (synthetic data)
+│   └── test_visualise.py       # neutral overlay labels (synthetic data)
 ├── requirements.txt
 └── README.md
 ```
@@ -236,26 +237,24 @@ Historical run: trained for 200 epochs on a Kaggle T4 GPU (wall-clock time was n
 
 The selected epoch (191) is the value stored in `best.pth`, read when the checkpoint still existed (2026-09-15); the file has since been lost. `metrics.csv` is rounded to 4 decimal places and shows five epochs tied at 0.9886, so the CSV alone cannot identify it.
 
-**What this number measures:** Dice was computed during training on a single centre-cropped 128³ validation patch per volume (`LiverCTDataset` in `'val'` mode, see `src/data/dataset.py`), and the checkpoint with the highest value on those same 26 volumes was kept. Full-volume inference (`src/inference/predict.py`, MONAI `sliding_window_inference`) was used only to generate the qualitative overlays below for 3 validation cases. Treat the number as an internally selected patch-level validation result, not a full-volume or externally validated benchmark.
+**What this number measures:** Dice was computed during training on a single centre-cropped 128³ validation patch per volume (`LiverCTDataset` in `'val'` mode, see `src/data/dataset.py`), and the checkpoint with the highest value on those same 26 volumes was kept. Full-volume inference (`src/inference/predict.py`, MONAI `sliding_window_inference`) was not used to compute this number; it was used only to generate the historical overlay figures discussed below. For volumes with an axis shorter than the 128-voxel crop size, the image is reflect-padded and the mask zero-padded to the crop size (`LiverCTDataset._pad_to_patch`). Treat the number as an internally selected patch-level validation result, not a full-volume or externally validated benchmark.
 
 ### Learning curves
 
 ![Learning curves: training loss and validation Dice over 200 epochs](docs/images/learning_curves.png)
 
-### Segmentation overlays
+### Historical qualitative overlays (removed)
 
-Three held-out validation volumes.  Each panel shows axial · coronal · sagittal slices with the predicted liver mask overlaid in pink.
+Historical qualitative overlay figures have been removed from this README because the three saved figures were found to contain identical visualization panels despite different case labels. The cause cannot be determined from the retained artifacts, so no conclusion about the underlying volumes is drawn.
 
-![liver_0](docs/images/liver_0_img.png)
-![liver_100](docs/images/liver_100_img.png)
-![liver_101](docs/images/liver_101_img.png)
+The image files remain under `docs/images/` for audit provenance only and must not be read as qualitative examples. `src/inference/visualise.py` no longer prints anatomical plane names, because the historical `.npy` arrays carry no orientation metadata.
 
 ---
 
 ## Limitations
 
 - **Historical Dice is internally selected and patch-level.** 0.9886 is the Dice on the 26-volume 128³ centre-cropped validation split used for model selection. It is not independent-test or full-volume performance. Single split, single seed, no cross-validation.
-- **No valid historical HD95.** The original implementation used pooled, non-surface distances; it has been fixed and is covered by regression tests (`tests/test_hd95.py`). A corrected physical-unit HD95 for the historical model cannot be recovered: the `.npy` data do not preserve voxel spacing and the trained checkpoint is no longer available. Earlier statements of a sub-millimetre or sub-voxel HD95 for this model are invalid.
+- **No valid historical HD95.** The original implementation used pooled, non-surface distances; it has been fixed and is covered by regression tests (`tests/test_hd95.py`). A corrected physical-unit HD95 for the historical model cannot be recovered: the `.npy` data do not preserve voxel spacing and the trained checkpoint is no longer available. Any earlier numerical HD95 statement for this model is invalid.
 - **New protocol not yet run.** `docs/EVALUATION_PROTOCOL.md` describes a leakage-controlled protocol for a new model (85 / 20 / 26 train / validation / test cases with the final test drawn only from cases that were not the historical validation set, NIfTI spacing, full-volume evaluation, HD95 in mm). It is tested on synthetic data only, has produced no results, and does not validate the historical model.
 - **Historical evaluation script.** `src/inference/evaluate.py` scores a historical-format `.npy` checkpoint on full volumes but can only report voxel units; it cannot be used for millimetre results.
 

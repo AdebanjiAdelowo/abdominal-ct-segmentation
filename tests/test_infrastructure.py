@@ -5,6 +5,7 @@ measures model quality.
 """
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src import smoke_test as st
 from src.data import splits as sp
 from src.data.nifti import list_cases
+from src.data import validate_dataset as vd
 from src.data.validate_dataset import validate_dataset
 from src.training import protocol_train as tp
 from src.training.trainer import Trainer
@@ -86,6 +88,9 @@ def test_cli_default_path_uses_the_msd_listing_only_after_the_evidence_check(tmp
     import src.data.nifti as nifti
     ids = [f"liver_{i}" for i in range(131)]
     monkeypatch.setattr(nifti, "list_cases", lambda d: {c: (None, None) for c in ids})
+    import src.data.validate_dataset as vd
+    gate_calls = []
+    monkeypatch.setattr(vd, "check_content_before_split", lambda cases, report=None: gate_calls.append(sorted(cases)))
     out = tmp_path / "s.json"
     monkeypatch.setattr(sys, "argv", ["splits", "make", "--data-dir", "ignored", "--out", str(out)])
     sp.main()
@@ -93,6 +98,7 @@ def test_cli_default_path_uses_the_msd_listing_only_after_the_evidence_check(tmp
     assert made["counts"] == {"train": 85, "val": 20, "test": 26} and "MSD listing" in made["historical_validation"]["listing_source"]
     assert not set(made["test"]) & set(made["historical_validation"]["case_ids"])
     assert made["historical_validation"]["case_ids"] == sorted(sp.historical_validation_cases(ids))
+    assert gate_calls == [sorted(ids)], "the duplicate-content gate must run before a split is written"
 
 
 def test_describe_uses_geometry_only(synthetic):
@@ -235,3 +241,129 @@ def test_smoke_test_runs_end_to_end_and_is_stamped_as_not_a_result(synthetic):
     assert not set(report["cases_used"]) & set(splits["test"]), "smoke test must never touch test cases"
     # the spacing seen through the whole chain is the physical spacing in canonical (x, y, z) order
     assert all(v == pytest.approx([0.7, 0.9, 3.0]) for v in report["spacing_mm"].values())
+
+
+# --------------------------------------------------------------------------
+# duplicate-content validation (synthetic data only)
+# --------------------------------------------------------------------------
+
+@pytest.fixture()
+def ds(tmp_path):
+    return st.make_synthetic_dataset(tmp_path / "ds", n_cases=6)
+
+
+def _dup_image(root, src, dst):
+    shutil.copy(root / "imagesTr" / f"{src}.nii.gz", root / "imagesTr" / f"{dst}.nii.gz")
+
+
+def _dup_label(root, src, dst):
+    shutil.copy(root / "labelsTr" / f"{src}.nii.gz", root / "labelsTr" / f"{dst}.nii.gz")
+
+
+def test_distinct_volumes_are_not_flagged(ds):
+    r = validate_dataset(str(ds), expect_cases=6)
+    assert r["errors"] == [] and r["duplicates"] == [] and r["content_check"] is True
+    assert len(set(r["hashes"]["image"].values())) == 6 and len(set(r["hashes"]["label"].values())) == 6
+
+
+def test_duplicated_image_is_detected_and_fails_validation(ds):
+    _dup_image(ds, "liver_1", "liver_4")                                   # same content, different case id
+    r = validate_dataset(str(ds), expect_cases=6)
+    groups = [g for g in r["duplicates"] if g["category"] == "image"]
+    assert len(groups) == 1 and groups[0]["cases"] == ["liver_1", "liver_4"] and len(groups[0]["sha256"]) == 64
+    assert not [g for g in r["duplicates"] if g["category"] == "label"]
+    msg = next(e for e in r["errors"] if e.startswith("Duplicate image content"))
+    assert "liver_1" in msg and "liver_4" in msg and groups[0]["sha256"][:16] in msg
+
+
+def test_three_way_duplicate_is_reported_as_one_group(ds):
+    _dup_image(ds, "liver_0", "liver_2")
+    _dup_image(ds, "liver_0", "liver_3")
+    groups = [g for g in validate_dataset(str(ds), 6)["duplicates"] if g["category"] == "image"]
+    assert len(groups) == 1 and groups[0]["cases"] == ["liver_0", "liver_2", "liver_3"]
+
+
+def test_duplicated_label_is_detected_and_fails_validation(ds):
+    _dup_label(ds, "liver_1", "liver_4")                                   # different image, identical mask
+    r = validate_dataset(str(ds), expect_cases=6)
+    groups = [g for g in r["duplicates"] if g["category"] == "label"]
+    assert len(groups) == 1 and groups[0]["cases"] == ["liver_1", "liver_4"]
+    assert not [g for g in r["duplicates"] if g["category"] == "image"]
+    assert any(e.startswith("Duplicate label content") for e in r["errors"])
+
+
+def test_header_only_differences_do_not_hide_a_duplicate(tmp_path):
+    arr = np.random.default_rng(3).normal(size=(12, 13, 14)).astype(np.float32)
+    a, b, c = tmp_path / "a.nii.gz", tmp_path / "b.nii", tmp_path / "c.nii.gz"
+    nib.save(nib.Nifti1Image(arr, np.diag([1.0, 1.0, 1.0, 1.0])), str(a))
+    nib.save(nib.Nifti1Image(arr.astype(np.float64), np.diag([0.7, 0.9, 3.0, 1.0])), str(b))      # other affine, dtype, no gzip
+    changed = arr.copy(); changed[5, 5, 5] += 1.0
+    nib.save(nib.Nifti1Image(changed, np.diag([1.0, 1.0, 1.0, 1.0])), str(c))
+    assert vd.image_content_hash(a) == vd.image_content_hash(b)             # header/dtype/compression ignored
+    assert vd.image_content_hash(a) != vd.image_content_hash(c)             # one voxel differs -> not a duplicate
+
+
+def test_flipped_copy_is_not_claimed_as_an_exact_duplicate(tmp_path):
+    arr = np.random.default_rng(4).normal(size=(10, 11, 12)).astype(np.float32)
+    nib.save(nib.Nifti1Image(arr, np.eye(4)), str(tmp_path / "a.nii.gz"))
+    nib.save(nib.Nifti1Image(arr[::-1].copy(), np.eye(4)), str(tmp_path / "flip.nii.gz"))
+    assert vd.image_content_hash(tmp_path / "a.nii.gz") != vd.image_content_hash(tmp_path / "flip.nii.gz")
+
+
+def test_no_content_check_skips_only_the_content_checks(ds, tmp_path):
+    _dup_image(ds, "liver_1", "liver_4")
+    r = validate_dataset(str(ds), expect_cases=6, content_check=False)
+    assert r["content_check"] is False and r["duplicates"] == [] and not any("Duplicate" in e for e in r["errors"])
+    (ds / "labelsTr" / "liver_0.nii.gz").unlink()                          # structural checks still run
+    assert any("Image without label" in e for e in validate_dataset(str(ds), 6, content_check=False)["errors"])
+    report = tmp_path / "skipped.json"
+    report.write_text(json.dumps(validate_dataset(str(ds), 6, content_check=False)))
+    with pytest.raises(SystemExit, match="no-content-check"):              # a skipped-check report cannot clear a dataset
+        vd.check_content_before_split(list_cases(str(st.make_synthetic_dataset(tmp_path / "other", 6))), str(report))
+
+
+def test_validator_cli_exit_codes_and_report(ds, tmp_path, monkeypatch):
+    report = tmp_path / "report.json"
+    monkeypatch.setattr(sys, "argv", ["v", "--data-dir", str(ds), "--expect-cases", "6", "--report", str(report)])
+    with pytest.raises(SystemExit) as ok:
+        vd.main()
+    assert ok.value.code == 0
+    rep = json.loads(report.read_text())
+    assert rep["content_check"] and rep["duplicates"] == [] and set(rep["hashes"]) == {"image", "label"} and "float32" in rep["hash_method"]
+    _dup_image(ds, "liver_1", "liver_4")
+    with pytest.raises(SystemExit) as bad:
+        vd.main()
+    assert bad.value.code == 1
+    assert json.loads(report.read_text())["duplicates"][0]["cases"] == ["liver_1", "liver_4"]
+
+
+def test_split_generation_refuses_duplicates_and_writes_nothing(ds, tmp_path, monkeypatch):
+    listing = tmp_path / "hist.txt"
+    listing.write_text("\n".join(sorted(list_cases(str(ds)))))
+    out = tmp_path / "splits.json"
+    argv = ["splits", "make", "--data-dir", str(ds), "--out", str(out), "--expect-n", "6", "--historical-listing", str(listing)]
+    _dup_image(ds, "liver_2", "liver_5")
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit, match="duplicate dataset content"):
+        sp.main()
+    assert not out.exists()
+    (ds / "imagesTr" / "liver_5.nii.gz").unlink()                          # restore a distinct volume for liver_5
+    st_arr = np.random.default_rng(99).normal(size=(40, 36, 32)).astype(np.float32)
+    nib.save(nib.Nifti1Image(st_arr, nib.load(str(ds / "imagesTr" / "liver_0.nii.gz")).affine), str(ds / "imagesTr" / "liver_5.nii.gz"))
+    sp.main()                                                              # clean dataset: split written
+    assert out.exists()
+
+
+def test_split_generation_accepts_a_matching_passing_report_without_rehashing(ds, tmp_path, monkeypatch):
+    report = tmp_path / "ok.json"
+    report.write_text(json.dumps(validate_dataset(str(ds), 6)))
+    cases = list_cases(str(ds))
+    monkeypatch.setattr(vd, "content_hashes", lambda c: (_ for _ in ()).throw(AssertionError("must not rehash")))
+    vd.check_content_before_split(cases, str(report))                      # passes, no hashing
+    partial = {k: v for k, v in list(cases.items())[:-1]}
+    with pytest.raises(SystemExit, match="exactly the current case listing"):
+        vd.check_content_before_split(partial, str(report))
+    bad = json.loads(report.read_text()); bad["duplicates"] = [{"category": "image", "sha256": "0" * 64, "cases": ["a", "b"]}]
+    report.write_text(json.dumps(bad))
+    with pytest.raises(SystemExit, match="duplicates"):
+        vd.check_content_before_split(cases, str(report))

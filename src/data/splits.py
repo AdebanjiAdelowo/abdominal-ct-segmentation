@@ -27,6 +27,9 @@ overwrites, so a split cannot be regenerated until a favourable test set appears
 A different seed or fractions means a new protocol version (new file, new
 fingerprint, new results) and must never be chosen by looking at performance.
 
+No split is generated over a dataset with duplicate content: ``make`` refuses if two different
+case ids share identical image or label voxel arrays (see ``validate_dataset``).
+
 The historical listing is not guessed.  By default it is taken to be the MSD
 listing itself, and generation is REFUSED unless that listing matches the recorded
 evidence about the historical dataset (``check_historical_naming``).  If the real
@@ -34,7 +37,7 @@ naming differs, supply the historical listing explicitly with ``--historical-lis
 
 CLI:
     python -m src.data.splits make --data-dir <Task03_Liver> --out splits/msd_task03_v1.json \
-        [--historical-listing historical_case_names.txt]
+        [--historical-listing historical_case_names.txt] [--validation-report validation.json]
     python -m src.data.splits verify --splits splits/msd_task03_v1.json
     python -m src.data.splits describe --data-dir <Task03_Liver> --splits splits/msd_task03_v1.json
 """
@@ -288,6 +291,9 @@ def main() -> None:
     mk.add_argument("--out", required=True)
     mk.add_argument("--expect-n", type=int, default=EXPECTED_CASES,
                     help="Refuse to freeze a split if the dataset does not have exactly this many labelled cases")
+    mk.add_argument("--validation-report", default=None,
+                    help="JSON from `validate_dataset --report`; if given and passing for exactly this listing, the duplicate-"
+                         "content check is not repeated. Otherwise it is computed here. There is no way to skip it.")
     mk.add_argument("--historical-listing", default=None,
                     help="Text file with the historical run's case names (one per line). Default: the MSD listing, "
                          "accepted only if it passes the historical-naming consistency check")
@@ -300,9 +306,12 @@ def main() -> None:
 
     if args.cmd == "make":
         from src.data.nifti import list_cases
-        case_ids = list(list_cases(args.data_dir))
+        cases = list_cases(args.data_dir)
+        case_ids = list(cases)
         if len(case_ids) != args.expect_n:
             raise SystemExit(f"Found {len(case_ids)} cases, expected {args.expect_n}: not freezing a split on an unexpected dataset.")
+        from src.data.validate_dataset import check_content_before_split
+        check_content_before_split(cases, args.validation_report)      # refuses duplicate images / labels
         if args.historical_listing:
             listing, source = read_listing_file(args.historical_listing), f"explicit file {args.historical_listing}"
         else:

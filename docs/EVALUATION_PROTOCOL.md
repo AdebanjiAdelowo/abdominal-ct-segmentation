@@ -42,6 +42,19 @@ The historical run used `.npy` files from a Kaggle mirror that is not available 
 * Before freezing, `python -m src.data.splits describe` may be used to look at non-performance characteristics (spacing, liver volume) for pathological imbalance. It reads headers and labels only and is not a search over seeds.
 * MSD Task03 pools several institutions and the public metadata does not label the site, so the split is random, not site-stratified. Site effects are a stated limitation.
 
+### 1.5 Dataset content validation before any split
+
+`python -m src.data.validate_dataset` checks the actual voxel content, not file names, before a split may be generated:
+
+* **Duplicate images:** two different case ids whose image voxel arrays are identical are an error.
+* **Duplicate labels:** two different case ids whose label voxel arrays are identical are also an error. Labels are already required to be non-empty, and two different patients cannot legitimately have voxel-identical non-empty 3-D masks; an identical mask under two ids means a copied or mislabelled file, which would silently corrupt training or evaluation.
+* **What is hashed:** SHA-256 over the array shape and voxel values, streamed in slabs. Images: C-order float32 after NIfTI scaling. Labels: rounded uint8. Headers, affines, storage dtype and compression are excluded, so files differing only in those still match. Only **exact** copies are detected: a flipped, transposed, cropped or resampled copy, or one differing in a single voxel, has a different hash. Geometry is validated separately.
+* **Reporting:** each group lists the category (image or label), the content hash and the case ids. `--report FILE` records the result with per-case hashes.
+* **Gate:** `splits make` refuses to write a split if duplicates exist. It reuses a passing `--validation-report` only if that report covers exactly the current case listing and was produced with the content check on; there is no option to skip the check.
+* **Cost:** the content check reads every volume, so expect several minutes on the full dataset. `--no-content-check` exists for quick structural inspection only and cannot clear a dataset for splitting.
+
+This was added because three historical overlay figures were found to be identical despite different case labels; the cause is undetermined, and nothing is concluded about the historical data. The check makes the same situation impossible to miss in the new experiment.
+
 ## 2. What may use which split
 
 | Activity | train | val | test |
@@ -97,8 +110,8 @@ Trained checkpoints are expensive and this project has already lost one.
 `colab/run_protocol.ipynb` is a thin launcher that only calls the commands below (nothing is reimplemented in cells): pin the commit, mount Drive, validate the dataset, verify or generate the split, smoke test, train with a Drive mirror, evaluate validation, and (only with an explicit flag) run the final test evaluation.
 
 ```bash
-python -m src.data.validate_dataset --data-dir Task03_Liver --expect-cases 131
-python -m src.data.splits make --data-dir Task03_Liver --out splits/msd_task03_v1.json   # once; then commit it
+python -m src.data.validate_dataset --data-dir Task03_Liver --expect-cases 131 --report validation.json   # includes duplicate-content checks
+python -m src.data.splits make --data-dir Task03_Liver --out splits/msd_task03_v1.json --validation-report validation.json   # once; then commit it
 python -m src.smoke_test --data-dir Task03_Liver --splits splits/msd_task03_v1.json --out-dir runs/smoke
 python -m src.training.protocol_train --data-dir Task03_Liver --splits splits/msd_task03_v1.json \
     --out-dir runs/protocol_v1 --mirror-dir /persistent/protocol_v1 --seed 0

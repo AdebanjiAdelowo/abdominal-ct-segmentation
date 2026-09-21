@@ -14,3 +14,11 @@ results.zip
 *.egg-info/
 dist/
 build/
+
+# Protocol runs, weights and dataset must never enter Git history
+runs/
+*.ckpt
+*.tar
+*.nii
+*.nii.gz
+Task03_Liver/

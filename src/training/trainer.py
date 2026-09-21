@@ -8,11 +8,18 @@ Key design choices:
   AMP        : torch.amp mixed-precision on CUDA; skipped gracefully on MPS/CPU.
   Grad clip  : L2 norm clipped at config.training.grad_clip to stabilise 3-D
                convolution training on large patch batches.
-  Checkpoints: 'best.pth' (highest val Dice) and 'last.pth' (most recent).
-  Metrics log: CSV with epoch, train_loss, val_dice, val_hd95, lr.
+  Checkpoints: 'best.pth' (highest val Dice) and 'last.pth' (most recent),
+               written atomically, stamped with seed / split fingerprint / git
+               commit / timestamp / model config, optionally mirrored to a
+               persistent directory (config.checkpoint.mirror_dir, e.g. Drive),
+               and resumable (``resume_from``).
+  Metrics log: CSV with epoch, train_loss, val_dice, val_hd95, lr.  The
+               val_hd95 column is a per-epoch diagnostic on one centre-cropped
+               patch in VOXEL units; it is not a reportable metric.
 """
 
 import csv
+import json
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Optional
@@ -25,6 +32,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from src.utils.metrics import dice_score, hausdorff_95
+from src.utils.provenance import (
+    atomic_torch_save, atomic_write_text, git_state, mirror_file, sha256_file, utc_now,
+)
+
+CHECKPOINT_FORMAT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +116,7 @@ class Trainer:
         config: Dict,
         device: torch.device,
         output_dir: str,
+        resume_from: Optional[str] = None,
     ) -> None:
         self.model = model.to(device)
         self.config = config
@@ -140,26 +153,64 @@ class Trainer:
         self.hd_percentile: int = cfg_val["hausdorff_percentile"]
 
         self.best_dice: float = -1.0
+        self.start_epoch: int = 1
         self.metrics_path = self.output_dir / config["logging"]["metrics_csv"]
-        self._init_csv()
+
+        cfg_ck = config.get("checkpoint", {})
+        self.mirror_dir: Optional[str] = cfg_ck.get("mirror_dir")
+        self.mirror_last_every: int = int(cfg_ck.get("mirror_last_every", 5))
+        self._git = git_state()
+        self._manifest: Dict[str, Dict] = {}
+
+        if resume_from:
+            self.resume(resume_from)
+        if not (resume_from and self.metrics_path.exists()):
+            self._init_csv()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def fit(self, train_loader, val_loader) -> None:
-        """Run the full training loop for config.training.epochs epochs."""
-        for epoch in range(1, self.epochs + 1):
+    def fit(self, train_loader, val_loader, stop_after_epoch: Optional[int] = None) -> None:
+        """
+        Run the training loop from ``start_epoch`` to config.training.epochs.
+
+        ``stop_after_epoch`` ends this session early (e.g. a Colab time limit)
+        without changing the schedule; continue later with ``resume_from``.
+        """
+        for epoch in range(self.start_epoch, self.epochs + 1):
             train_loss = self._train_epoch(train_loader, epoch)
             val_metrics: Dict = {}
 
             if epoch % self.val_interval == 0:
                 val_metrics = self._validate(val_loader, epoch)
-                if self.config["checkpoint"]["save_best"]:
-                    self._maybe_save_checkpoint(val_metrics["dice"], epoch)
 
             self.scheduler.step()
             self._log_metrics(epoch, train_loss, val_metrics)
+
+            # Saved AFTER scheduler.step() so a resumed run continues the LR schedule exactly.
+            if val_metrics and self.config["checkpoint"]["save_best"]:
+                self._maybe_save_checkpoint(val_metrics["dice"], epoch)
+
+            if stop_after_epoch is not None and epoch >= stop_after_epoch:
+                print(f"  Stopping this session after epoch {epoch}; resume from last.pth to continue.")
+                break
+
+    def resume(self, path: str) -> None:
+        """Restore model/optimiser/scheduler/best-Dice from a checkpoint written by this trainer."""
+        ckpt = torch.load(path, map_location=self.device)
+        want = (self.config.get("protocol") or {}).get("splits_sha256")
+        have = ((ckpt.get("config") or {}).get("protocol") or {}).get("splits_sha256")
+        if want != have:
+            raise ValueError(f"Refusing to resume: checkpoint split fingerprint {have} != current {want}")
+        self.model.load_state_dict(ckpt["model_state"])
+        self.optimiser.load_state_dict(ckpt["optimiser_state"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state"])
+        if self.scaler is not None and ckpt.get("scaler_state"):
+            self.scaler.load_state_dict(ckpt["scaler_state"])
+        self.best_dice = float(ckpt.get("best_dice", ckpt["val_dice"]))
+        self.start_epoch = int(ckpt["epoch"]) + 1
+        print(f"  Resumed from {path}: continuing at epoch {self.start_epoch}, best Dice so far {self.best_dice:.4f}")
 
     # ------------------------------------------------------------------
     # Private: training
@@ -237,7 +288,7 @@ class Trainer:
 
         print(
             f"  Epoch {epoch:03d} │ val Dice {mean_dice:.4f} │ "
-            f"val HD95 {mean_hd95:.2f} mm"
+            f"val HD95 {mean_hd95:.2f} voxels"
         )
         return {"dice": mean_dice, "hd95": mean_hd95}
 
@@ -245,21 +296,59 @@ class Trainer:
     # Private: checkpointing and logging
     # ------------------------------------------------------------------
 
-    def _maybe_save_checkpoint(self, val_dice: float, epoch: int) -> None:
-        ckpt = {
+    def _build_checkpoint(self, val_dice: float, epoch: int) -> Dict:
+        protocol = self.config.get("protocol") or {}
+        return {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
             "epoch": epoch,
             "model_state": self.model.state_dict(),
             "optimiser_state": self.optimiser.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
+            "scaler_state": self.scaler.state_dict() if self.scaler is not None else None,
             "val_dice": val_dice,
+            "best_dice": max(self.best_dice, val_dice),
             "config": self.config,
+            "model_config": self.config["model"],
+            "seed": protocol.get("seed"),
+            "split_sha256": protocol.get("splits_sha256"),
+            "git_commit": self._git["commit"],
+            "git_dirty": self._git["dirty"],
+            "timestamp_utc": utc_now(),
         }
-        torch.save(ckpt, self.output_dir / "last.pth")
 
-        if val_dice > self.best_dice:
+    def _maybe_save_checkpoint(self, val_dice: float, epoch: int) -> None:
+        ckpt = self._build_checkpoint(val_dice, epoch)
+        last = self.output_dir / "last.pth"
+        atomic_torch_save(ckpt, last)
+        self._manifest["last"] = {"epoch": epoch, "val_dice": val_dice, "timestamp_utc": ckpt["timestamp_utc"]}
+
+        is_best = val_dice > self.best_dice
+        if is_best:
             self.best_dice = val_dice
-            torch.save(ckpt, self.output_dir / "best.pth")
+            best = self.output_dir / "best.pth"
+            atomic_torch_save(ckpt, best)
+            self._manifest["best"] = {"epoch": epoch, "val_dice": val_dice, "timestamp_utc": ckpt["timestamp_utc"],
+                                      "sha256": sha256_file(best)}
             print(f"  ✓ New best Dice {val_dice:.4f} — saved to best.pth")
+
+        self._write_manifest(ckpt)
+        self._mirror(epoch, is_best)
+
+    def _write_manifest(self, ckpt: Dict) -> None:
+        doc = {"format_version": CHECKPOINT_FORMAT_VERSION, "seed": ckpt["seed"], "split_sha256": ckpt["split_sha256"],
+               "git_commit": ckpt["git_commit"], "git_dirty": ckpt["git_dirty"], **self._manifest}
+        atomic_write_text(self.output_dir / "checkpoint_manifest.json", json.dumps(doc, indent=2))
+
+    def _mirror(self, epoch: int, is_best: bool) -> None:
+        """Copy to persistent storage (verified). best.pth every time it improves; last.pth every N epochs."""
+        if not self.mirror_dir:
+            return
+        if is_best:
+            mirror_file(self.output_dir / "best.pth", self.mirror_dir)
+        if epoch % self.mirror_last_every == 0 or epoch == self.epochs:
+            mirror_file(self.output_dir / "last.pth", self.mirror_dir)
+        mirror_file(self.output_dir / "checkpoint_manifest.json", self.mirror_dir, verify_hash=False)
+        mirror_file(self.metrics_path, self.mirror_dir, verify_hash=False)
 
     def _init_csv(self) -> None:
         with open(self.metrics_path, "w", newline="") as f:

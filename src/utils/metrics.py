@@ -75,11 +75,13 @@ def hausdorff_95(
         target:        Binary ground-truth, same shape as pred.
         percentile:    Percentile applied independently to each directional
                         surface-distance distribution.
-        voxel_spacing: Physical voxel spacing in mm (d, h, w). Used to convert
-                       voxel indices to metric distances.
+        voxel_spacing: Voxel spacing (d, h, w) used to scale index distances.
+                       Defaults to (1, 1, 1), in which case the result is in
+                       VOXELS; it is in mm only if true spacing in mm is given.
 
     Returns:
-        HD at the requested percentile in mm; float('inf') if either mask
+        HD at the requested percentile, in units of voxel_spacing (voxels by
+        default); float('inf') if either mask
         is empty (handles edge cases during early training).
     """
     pred_bin = (pred.squeeze() > 0.5).astype(bool)

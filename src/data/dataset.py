@@ -17,7 +17,7 @@ Expected directory layout (configurable via configs/config.yaml):
 
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -184,26 +184,88 @@ class LiverCTDataset(Dataset):
         )
 
 
+class NiftiLiverDataset(LiverCTDataset):
+    """
+    Patch dataset over MSD-layout NIfTI cases (``imagesTr/*.nii.gz`` +
+    ``labelsTr/*.nii.gz``) for the leakage-controlled protocol.
+
+    Reuses the padding / patch-sampling logic of :class:`LiverCTDataset`; only
+    file discovery and loading differ.  Volumes stay on their native grid (no
+    resampling), reoriented to RAS+, so the same preprocessing applies at
+    evaluation time and voxel spacing is known for every case.
+
+    Args:
+        cases:  Mapping case id -> (image_path, label_path) for THIS split only.
+        mode:   ``'train'`` (random, foreground-biased patches) or ``'val'``
+                (deterministic centre crop).
+        config: Full config dict.
+    """
+
+    def __init__(self, cases: Dict[str, Tuple[Path, Path]], mode: str, config: Dict) -> None:
+        assert mode in {"train", "val"}, f"Unknown mode: {mode}"
+        if not cases:
+            raise ValueError("NiftiLiverDataset needs at least one case")
+        self.mode = mode
+        self.cfg_pre = config["preprocessing"]
+        self.patch_size = tuple(self.cfg_pre["patch_size"])  # type: ignore[assignment]
+        self.names = sorted(cases)
+        self.samples = [cases[n] for n in self.names]  # type: ignore[assignment]
+
+    def __getitem__(self, idx: int) -> Dict[str, object]:
+        from src.data.nifti import load_case, preprocess_ct
+
+        img_path, lbl_path = self.samples[idx]
+        case = load_case(str(img_path), str(lbl_path))
+        volume = preprocess_ct(case["image"], self.cfg_pre)
+        mask = case["mask"].astype(np.float32)
+        volume, mask = self._extract_patch(volume, mask)
+        return {
+            "image": torch.from_numpy(volume).unsqueeze(0),
+            "mask": torch.from_numpy(mask).unsqueeze(0),
+            "name": self.names[idx],
+        }
+
+
 # ---------------------------------------------------------------------------
 # DataLoader factory
 # ---------------------------------------------------------------------------
 
-def build_dataloaders(
+HISTORICAL_SPLIT_SEED = 42
+
+
+def historical_train_val_split(
+    names: Sequence[str],
+    val_split: float,
+    seed: int = HISTORICAL_SPLIT_SEED,
+) -> Tuple[List[str], List[str]]:
+    """
+    The historical deterministic train/validation split, as a pure function.
+
+    ``np.random.default_rng(seed).permutation`` of the SORTED case names; the
+    first ``max(1, int(n * val_split))`` names are the validation cases.  The
+    historical model (val_split 0.2, seed 42, 131 cases -> 105 / 26) used exactly
+    this, and the new protocol calls it to identify which cases are already
+    "used up" as historical validation cases, so the two cannot drift apart.
+    """
+    ordered = sorted(names)
+    shuffled = np.random.default_rng(seed).permutation(ordered).tolist()
+    n_val = max(1, int(len(shuffled) * val_split))
+    return shuffled[n_val:], shuffled[:n_val]
+
+
+def split_case_names(
     config: Dict,
     data_dir: str,
-) -> Tuple[DataLoader, DataLoader]:
+) -> Tuple[List[str], List[str]]:
     """
-    Build train and validation DataLoaders.
+    Deterministic train/validation split of case names.
 
-    A fixed seed (42) is used for the train/val file split to ensure
-    reproducible runs.  The val_split fraction from config is held out.
-
-    Args:
-        config:   Full config dict from config.yaml.
-        data_dir: Root data directory (local or Kaggle path).
+    A fixed seed (42) is used so every run, and the standalone evaluator in
+    ``src/inference/evaluate.py``, sees the same held-out cases.  The
+    val_split fraction from config is held out.
 
     Returns:
-        (train_loader, val_loader)
+        (train_files, val_files) as lists of case names (no suffix / extension).
     """
     images_dir = Path(data_dir) / config["dataset"]["images_subdir"]
     img_suffix = config["dataset"].get("images_suffix", "")
@@ -218,12 +280,26 @@ def build_dataloaders(
             "Verify the Kaggle dataset path and images_subdir."
         )
 
-    rng = np.random.default_rng(42)
-    shuffled = rng.permutation(all_files).tolist()
+    return historical_train_val_split(all_files, config["dataset"]["val_split"])
 
-    n_val = max(1, int(len(shuffled) * config["dataset"]["val_split"]))
-    val_files = shuffled[:n_val]
-    train_files = shuffled[n_val:]
+
+def build_dataloaders(
+    config: Dict,
+    data_dir: str,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Build train and validation DataLoaders.
+
+    The train/val split comes from :func:`split_case_names`.
+
+    Args:
+        config:   Full config dict from config.yaml.
+        data_dir: Root data directory (local or Kaggle path).
+
+    Returns:
+        (train_loader, val_loader)
+    """
+    train_files, val_files = split_case_names(config, data_dir)
 
     train_ds = LiverCTDataset(data_dir, train_files, "train", config)
     val_ds = LiverCTDataset(data_dir, val_files, "val", config)

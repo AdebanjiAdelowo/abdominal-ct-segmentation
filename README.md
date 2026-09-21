@@ -87,31 +87,46 @@ Volumes are split 80/20 into train/validation with a fixed seed (`np.random.defa
 abdominal-ct-segmentation/
 ├── src/
 │   ├── data/
-│   │   └── dataset.py          # LiverCTDataset, build_dataloaders
+│   │   ├── dataset.py          # LiverCTDataset, NiftiLiverDataset, split_case_names, build_dataloaders
+│   │   ├── nifti.py            # NIfTI loading with voxel spacing / orientation handling
+│   │   ├── splits.py           # frozen 3-way split, SHA-256 fingerprint
+│   │   └── validate_dataset.py # dataset structure checks
 │   ├── models/
 │   │   └── unet3d.py           # UNet3D, ConvBlock, EncoderBlock, DecoderBlock
 │   ├── training/
-│   │   └── trainer.py          # Trainer, SoftDiceLoss, CombinedLoss
+│   │   ├── trainer.py          # Trainer (atomic checkpoints, resume), SoftDiceLoss, CombinedLoss
+│   │   └── protocol_train.py   # training under the new protocol
 │   ├── inference/
 │   │   ├── predict.py          # sliding-window inference (MONAI)
+│   │   ├── evaluate.py         # historical .npy format: full-volume Dice + HD95 in voxels only
+│   │   ├── evaluate_protocol.py# new protocol: NIfTI, full-volume Dice + HD95 in mm, test-set guards
 │   │   └── visualise.py        # axial/coronal/sagittal PNG output
-│   └── utils/
-│       ├── device.py           # CUDA → MPS → CPU selection
-│       └── metrics.py          # Dice score, surface-based HD95 (scipy erosion + cKDTree)
+│   ├── utils/
+│   │   ├── device.py           # CUDA → MPS → CPU selection
+│   │   ├── metrics.py          # Dice score, surface-based HD95 (scipy erosion + cKDTree)
+│   │   └── provenance.py       # atomic writes, verified mirror copies, git state, checkpoint checks
+│   └── smoke_test.py           # end-to-end infrastructure smoke test (never a result)
 ├── kaggle/
-│   └── train_kaggle.py         # Kaggle notebook entry point
+│   └── train_kaggle.py         # historical Kaggle entry point (.npy pipeline)
+├── colab/
+│   └── run_protocol.ipynb      # thin launcher: calls the CLIs above on a Colab GPU
 ├── configs/
 │   └── config.yaml             # all hyperparameters
-├── docs/images/                # figures embedded in this README
+├── docs/
+│   ├── EVALUATION_PROTOCOL.md  # split, leakage rules, mm-HD95, aggregation, reporting rules
+│   └── images/                 # figures embedded in this README
 ├── notebooks/
 │   └── results.ipynb           # reads metrics.csv, renders learning curves and overlays
 ├── tests/
-│   └── test_hd95.py            # HD95 regression tests (synthetic, known-answer geometry)
+│   ├── test_hd95.py            # HD95 regression tests (synthetic, known-answer geometry)
+│   ├── test_evaluate.py        # historical full-volume evaluator (synthetic data)
+│   ├── test_protocol.py        # split, NIfTI geometry, mm-HD95, leakage guards (synthetic data)
+│   └── test_infrastructure.py  # checkpoints, resume, validator, smoke test (synthetic data)
 ├── requirements.txt
 └── README.md
 ```
 
-`checkpoints/`, `outputs/`, `data/`, and `results/` (with the trained `best.pth`, `metrics.csv`, and visualisation PNGs) are populated by running training but are excluded from version control via `.gitignore`; the figures under `docs/images/` are the tracked copies used to render this README.
+`checkpoints/`, `outputs/`, `data/`, and `results/` (historically holding the trained `best.pth`, which has since been lost, plus `metrics.csv` and visualisation PNGs) are excluded from version control via `.gitignore`; checkpoints and the dataset must never be committed; the figures under `docs/images/` are the tracked copies used to render this README.
 
 ---
 
@@ -196,32 +211,36 @@ All hyperparameters are in `configs/config.yaml`.  Notable entries:
 | Metric | Description |
 |---|---|
 | **Dice** | Volumetric overlap: $2\|P \cap G\| / (\|P\| + \|G\|)$ |
-| **HD95** | 95th percentile of the pooled bidirectional nearest-neighbour distance (mm) |
+| **HD95** | Surface-based: 95th percentile of each directed surface-to-surface distance, max of the two directions. The historical `.npy` pipeline could only compute it in **voxels** (no spacing metadata). The new NIfTI protocol computes it in **mm** from each volume's own voxel spacing |
 
-HD95 is computed via `scipy.spatial.cKDTree` nearest-neighbour search (`hausdorff_95` in `src/utils/metrics.py`), avoiding an external `medpy` dependency. An earlier version of this function differed from the surface-distance convention used by MONAI's `compute_hausdorff_distance` and MedPy's `hd95` in two ways: it queried nearest neighbours over all foreground voxels of the prediction and ground truth rather than over extracted surface/boundary voxels only, and it pooled the prediction-to-target and target-to-prediction distances into a single array and took one percentile of the pooled array, rather than taking the 95th percentile of each direction separately and reporting the maximum of the two. That version is why HD95 read exactly 0.00 mm for most of the 200-epoch training run reported below despite Dice not yet being perfect: once a mask overlapped well, correctly classified interior voxels (distance 0) vastly outnumbered boundary voxels in that pooled, non-surface point set, pulling the percentile toward zero regardless of the true boundary error.
+HD95 is computed via `scipy.spatial.cKDTree` nearest-neighbour search (`hausdorff_95` in `src/utils/metrics.py`), avoiding an external `medpy` dependency. An earlier version of this function differed from the surface-distance convention used by MONAI's `compute_hausdorff_distance` and MedPy's `hd95` in two ways: it queried nearest neighbours over all foreground voxels of the prediction and ground truth rather than over extracted surface/boundary voxels only, and it pooled the prediction-to-target and target-to-prediction distances into a single array and took one percentile of the pooled array, rather than taking the 95th percentile of each direction separately and reporting the maximum of the two. That version is why the logged HD95 read at or near zero for almost the whole 200-epoch training run reported below despite Dice not yet being perfect: once a mask overlapped well, correctly classified interior voxels (distance 0) vastly outnumbered boundary voxels in that pooled, non-surface point set, pulling the percentile toward zero regardless of the true boundary error.
 
 `hausdorff_95` has since been corrected: it now extracts surface voxels from each mask via binary erosion (`scipy.ndimage.binary_erosion`), computes directed nearest-neighbour surface distances independently in each direction, takes the 95th percentile of each direction separately, and returns the maximum of the two (`src/utils/metrics.py`, and see `tests/test_hd95.py`). A controlled synthetic check (two 40-voxel-edge solid cubes offset by a known 3-voxel shift) confirms the fix: the old implementation returned 1.05 voxels on that input, while the corrected implementation returns 3.0 voxels, matching the true offset exactly and agreeing with the MONAI/MedPy convention.
 
-The 200-epoch training run whose curves and table appear below was logged with the old, buggy `hausdorff_95`, so the historical `val_hd95` column in `results/metrics.csv` is not a valid boundary-accuracy figure and is kept only as a raw historical record, not a claim. Recomputing a corrected HD95 for that specific trained model would require either saved per-epoch prediction volumes (not retained) or re-running full-volume inference against the original dataset split; neither was available at the time of the fix, so no corrected HD95 number is reported for the trained model below. The Dice score is unaffected by this bug and remains valid as reported.
+The 200-epoch training run whose curves and table appear below was logged with the old, buggy `hausdorff_95`, so the historical `val_hd95` column in `results/metrics.csv` is not a valid boundary-accuracy figure; it is kept only as a raw historical record, is not plotted, and must not be cited. **A corrected physical-unit HD95 cannot be recovered for that model**: its `.npy` evaluation data carry no voxel spacing, and its trained checkpoint is no longer available. The Dice score is unaffected by the HD95 bug.
+
+A new evaluation protocol for a *new* model (separate train / validation / test cases, NIfTI voxel spacing, full-volume inference, HD95 in mm) is implemented and tested on synthetic data; see [docs/EVALUATION_PROTOCOL.md](docs/EVALUATION_PROTOCOL.md). It has not yet produced results, and it does not validate the historical model.
 
 ---
 
 ## Results
 
-Trained for 200 epochs on a Kaggle T4 GPU (wall-clock time was not logged).  Dice jumped from **0.69 to 0.90** in the first two epochs due to foreground-biased patch sampling, then converged steadily (values from `results/metrics.csv`).
+Historical run: trained for 200 epochs on a Kaggle T4 GPU (wall-clock time was not logged). Dice jumped from **0.69 to 0.90** in the first two epochs due to foreground-biased patch sampling, then converged steadily (values from `results/metrics.csv`).
 
-| Model | Val Dice ↑ | Val HD95 (mm) | Best Epoch | Final Train Loss |
-|---|---|---|---|---|
-| UNet3D (depth=4, base=32) | **0.9886** | not available (see below) | 189 / 200 | 0.0122 |
-| UNet3D-residual (depth=4) | n/a | n/a | n/a | `model.residual: true` |
+| Model | Val Dice | Selected checkpoint epoch | Final train loss |
+|---|---|---|---|
+| UNet3D (depth=4, base=32) | **0.9886** | 191 / 200 (checkpoint metadata) | 0.0122 |
+| UNet3D-residual (depth=4) | n/a | n/a | `model.residual: true`, not trained |
 
-**0.9886 Dice on a 128³-patch internal validation split (no independent test set).** The `val_hd95` column logged during this run used the buggy pooled, non-surface `hausdorff_95` described above and read 0.00 mm for nearly the entire run; that figure should not be cited as a boundary-accuracy result. `hausdorff_95` has since been fixed and is covered by a synthetic regression test (`tests/test_hd95.py`) that verifies it against a known-correct geometric answer, but no saved prediction volumes or checkpoints-plus-dataset pairing were available to recompute a real HD95 for this specific trained model after the fix, so no corrected HD95 number is reported here. Recomputing one would require re-running full-volume sliding-window inference (`src/inference/predict.py`) against the original MSD Task03 validation split and the saved `results/checkpoints/best.pth` weights. The non-residual baseline already achieves strong Dice; the residual variant is left for future comparison.
+**0.9886 Dice on the 26-volume 128³ centre-cropped validation split used for model selection.** It is not independent test performance and not full-volume performance. No HD95 is reported for this model (see Evaluation Metrics). The non-residual baseline already achieves strong Dice; the residual variant is left for future comparison.
 
-**What these numbers measure:** both metrics are computed during training on a single centre-cropped 128³ validation patch per volume (`LiverCTDataset` in `'val'` mode, see `src/data/dataset.py`), the same patch size used for training, not on full-volume sliding-window inference. Full-volume inference (`src/inference/predict.py`, MONAI `sliding_window_inference`) is used only to generate the qualitative overlays below for 3 held-out cases; it is not what the Dice/HD95 table reports. Treat the table as a patch-level validation result on this dataset, not a full-volume or externally validated benchmark.
+The selected epoch (191) is the value stored in `best.pth`, read when the checkpoint still existed (2026-09-15); the file has since been lost. `metrics.csv` is rounded to 4 decimal places and shows five epochs tied at 0.9886, so the CSV alone cannot identify it.
+
+**What this number measures:** Dice was computed during training on a single centre-cropped 128³ validation patch per volume (`LiverCTDataset` in `'val'` mode, see `src/data/dataset.py`), and the checkpoint with the highest value on those same 26 volumes was kept. Full-volume inference (`src/inference/predict.py`, MONAI `sliding_window_inference`) was used only to generate the qualitative overlays below for 3 validation cases. Treat the number as an internally selected patch-level validation result, not a full-volume or externally validated benchmark.
 
 ### Learning curves
 
-![Learning curves: train loss, val Dice, val HD95 over 200 epochs](docs/images/learning_curves.png)
+![Learning curves: training loss and validation Dice over 200 epochs](docs/images/learning_curves.png)
 
 ### Segmentation overlays
 
@@ -235,14 +254,10 @@ Three held-out validation volumes.  Each panel shows axial · coronal · sagitta
 
 ## Limitations
 
-The HD95 metric implementation had a bug (pooled, non-surface distance) that produced an
-invalid 0.00 mm reading for nearly the entire training run; it has since been fixed and is
-covered by a synthetic regression test (`tests/test_hd95.py`). A corrected HD95 for the
-already-trained model could not be recomputed, since the MSD Task03 dataset is not present
-locally and no saved prediction volumes exist to recompute against directly. The old 0.00 mm
-figure should not be treated as valid. Recomputing a corrected value would require
-`src/inference/predict.py` against `results/checkpoints/best.pth` and the fixed `hausdorff_95`,
-once the dataset is available.
+- **Historical Dice is internally selected and patch-level.** 0.9886 is the Dice on the 26-volume 128³ centre-cropped validation split used for model selection. It is not independent-test or full-volume performance. Single split, single seed, no cross-validation.
+- **No valid historical HD95.** The original implementation used pooled, non-surface distances; it has been fixed and is covered by regression tests (`tests/test_hd95.py`). A corrected physical-unit HD95 for the historical model cannot be recovered: the `.npy` data do not preserve voxel spacing and the trained checkpoint is no longer available. Earlier statements of a sub-millimetre or sub-voxel HD95 for this model are invalid.
+- **New protocol not yet run.** `docs/EVALUATION_PROTOCOL.md` describes a leakage-controlled protocol for a new model (85 / 20 / 26 train / validation / test cases with the final test drawn only from cases that were not the historical validation set, NIfTI spacing, full-volume evaluation, HD95 in mm). It is tested on synthetic data only, has produced no results, and does not validate the historical model.
+- **Historical evaluation script.** `src/inference/evaluate.py` scores a historical-format `.npy` checkpoint on full volumes but can only report voxel units; it cannot be used for millimetre results.
 
 ## References
 

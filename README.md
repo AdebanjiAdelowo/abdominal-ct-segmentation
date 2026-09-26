@@ -167,8 +167,6 @@ subprocess.run([
 
 Outputs are written to `/kaggle/working/`: `checkpoints/best.pth`, `checkpoints/last.pth`, `metrics.csv`, and per-case visualisation PNGs.
 
-> **Kaggle notebook:** _link placeholder, will be updated after first run_
-
 ### Locally (Apple Silicon or any CUDA machine)
 
 1. Place the dataset under `data/`, matching the Kaggle layout the config expects by default:
@@ -221,6 +219,28 @@ HD95 is computed via `scipy.spatial.cKDTree` nearest-neighbour search (`hausdorf
 The 200-epoch training run whose curves and table appear below was logged with the old, buggy `hausdorff_95`, so the historical `val_hd95` column in `results/metrics.csv` is not a valid boundary-accuracy figure; it is kept only as a raw historical record, is not plotted, and must not be cited. **A corrected physical-unit HD95 cannot be recovered for that model**: its `.npy` evaluation data carry no voxel spacing, and its trained checkpoint is no longer available. The Dice score is unaffected by the HD95 bug.
 
 A new evaluation protocol for a *new* model (separate train / validation / test cases, NIfTI voxel spacing, full-volume inference, HD95 in mm) is implemented and tested on synthetic data; see [docs/EVALUATION_PROTOCOL.md](docs/EVALUATION_PROTOCOL.md). It has not yet produced results, and it does not validate the historical model.
+
+The two evaluation paths side by side. Only the left path has produced a result:
+
+```mermaid
+flowchart TD
+    subgraph H["Historical pipeline (produced the reported Dice)"]
+        H1[".npy volumes, no voxel spacing<br/>131 labelled cases"]
+        H2["split 105 train / 26 val<br/>seed 42"]
+        H3["train 3D U-Net, 200 epochs<br/>128³ patches, 50% foreground-biased<br/>soft-Dice + BCE, AdamW, cosine LR"]
+        H4["per-epoch validation<br/>one 128³ centre crop per val case"]
+        H5["checkpoint with best val Dice<br/>epoch 191, Dice 0.9886 (patch-level)"]
+        H1 --> H2 --> H3 --> H4 --> H5
+        H4 -.selects.-> H5
+    end
+    subgraph N["New protocol (implemented, tested on synthetic data, not yet run)"]
+        N1["NIfTI volumes with voxel spacing"]
+        N2["test: 26 cases drawn from the 105<br/>that were never historical val cases"]
+        N3["remaining 105: 85 train / 20 val"]
+        N4["full-volume sliding-window inference<br/>Dice and HD95 in mm, test used once"]
+        N1 --> N2 --> N3 --> N4
+    end
+```
 
 ---
 
